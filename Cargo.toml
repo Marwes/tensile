@@ -1,0 +1,12 @@
+[package]
+name = "tensile"
+version = "0.1.0"
+authors = ["Markus Westerlind <marwes91@gmail.com>"]
+
+[dependencies]
+futures = "0.1"
+tokio-core = "0.1"
+
+[[test]]
+name = "dog_food"
+harness = false
