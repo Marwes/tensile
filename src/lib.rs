@@ -1,4 +1,5 @@
 extern crate futures;
+extern crate futures_cpupool;
 extern crate tokio_core;
 
 use std::fmt;
@@ -147,6 +148,7 @@ impl<Error> Test<Error> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum TestProgress<Error> {
     GroupStart(String),
     GroupEnd,
@@ -190,8 +192,9 @@ where
                     format!("{}/{}", path, name)
                 };
                 Box::new(
-                    sink.send(TestProgress::GroupStart(owned_path.clone()))
-                        .and_then(|sink| Self::print_all(tests, owned_path, sink)),
+                    sink.send(TestProgress::GroupStart(name.into()))
+                        .and_then(|sink| Self::print_all(tests, owned_path, sink))
+                        .and_then(|sink| sink.send(TestProgress::GroupEnd)),
                 )
             }
         }
@@ -224,7 +227,6 @@ where
     }
 }
 
-
 pub fn console_runner<Error>(test: Test<Error>) -> Result<(), ()>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -255,8 +257,95 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use futures::Stream;
+    use futures::sync::mpsc::channel;
+
+    use futures_cpupool::CpuPool;
+
+    fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
+    where
+        Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    {
+        let running_test = test.run_all();
+
+        let mut core = Core::new().unwrap();
+
+        let (sender, receiver) = channel(10);
+        let pool = CpuPool::new(1);
+        let collector_future = pool.spawn(receiver.collect());
+
+        core.handle().spawn(
+            running_test
+                .print("", sender.sink_map_err(|_| panic!()))
+                .map(|_| ())
+                .map_err(|_| ()),
+        );
+
+        core.run(collector_future).unwrap()
+    }
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn simple() {
+        let progress = test_test(test("1", true));
+        assert_eq!(progress, vec![TestProgress::Test("1".to_string(), Ok(()))]);
+    }
+
+    #[test]
+    fn grouped_tests() {
+        let progress = test_test(group("group", vec![test("1", true), test("2", false)]));
+        assert_eq!(
+            progress,
+            vec![
+                TestProgress::GroupStart("group".into()),
+                TestProgress::Test("1".into(), Ok(())),
+                TestProgress::Test("2".into(), Err("false".to_string())),
+                TestProgress::GroupEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_groups() {
+        let progress = test_test(group(
+            "group",
+            vec![test("1", true), group("inner", vec![])],
+        ));
+        assert_eq!(
+            progress,
+            vec![
+                TestProgress::GroupStart("group".into()),
+                TestProgress::Test("1".into(), Ok(())),
+                TestProgress::GroupStart("inner".into()),
+                TestProgress::GroupEnd,
+                TestProgress::GroupEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_test_and_groups() {
+        let progress = test_test(group(
+            "group",
+            vec![
+                group("inner1", vec![test("test1", true)]),
+                test("middle test", true),
+                group("inner2", vec![]),
+            ],
+        ));
+        assert_eq!(
+            progress,
+            vec![
+                TestProgress::GroupStart("group".into()),
+                TestProgress::GroupStart("inner1".into()),
+                TestProgress::Test("test1".into(), Ok(())),
+                TestProgress::GroupEnd,
+                TestProgress::Test("middle test".to_string(), Ok(())),
+                TestProgress::GroupStart("inner2".into()),
+                TestProgress::GroupEnd,
+                TestProgress::GroupEnd,
+            ]
+        );
     }
 }
