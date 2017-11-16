@@ -1,11 +1,15 @@
 extern crate futures;
 extern crate futures_cpupool;
+extern crate num_cpus;
 extern crate tokio_core;
 
 use std::fmt;
 
 use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
+
 use tokio_core::reactor::Core;
+
+use futures_cpupool::CpuPool;
 
 pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + Sync + 'static>;
 
@@ -122,16 +126,19 @@ where
     }
 }
 
-impl<Error> Test<Error> {
-    fn run_all(self) -> RunningTest<Error> {
-        self.run_test("")
+impl<Error> Test<Error>
+where
+    Error: Send + 'static,
+{
+    fn run_all(self, cpu_pool: &CpuPool) -> RunningTest<Error> {
+        self.run_test(cpu_pool, "")
     }
 
-    fn run_test(self, path: &str) -> RunningTest<Error> {
+    fn run_test(self, cpu_pool: &CpuPool, path: &str) -> RunningTest<Error> {
         match self {
             Test::Test { name, test } => RunTest::Test {
                 name,
-                test: test.test(),
+                test: Box::new(cpu_pool.spawn(test.test())),
             },
             Test::Group { name, tests } => {
                 let test_path = format!("{}/{}", path, name);
@@ -140,7 +147,7 @@ impl<Error> Test<Error> {
                     name: name,
                     tests: tests
                         .into_iter()
-                        .map(|test| test.run_test(&test_path))
+                        .map(|test| test.run_test(cpu_pool, &test_path))
                         .collect(),
                 }
             }
@@ -249,7 +256,9 @@ where
         })
     });
 
-    let running_test = test.run_all();
+    // Add one for the console output thread which wont consume much cpu
+    let pool = CpuPool::new(num_cpus::get() + 1);
+    let running_test = test.run_all(&pool);
 
     let mut core = Core::new().unwrap();
     core.run(running_test.print("", sink).map(|_| ()))
@@ -268,12 +277,12 @@ mod tests {
     where
         Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
     {
-        let running_test = test.run_all();
+        let pool = CpuPool::new(4);
+        let running_test = test.run_all(&pool);
 
         let mut core = Core::new().unwrap();
 
         let (sender, receiver) = channel(10);
-        let pool = CpuPool::new(1);
         let collector_future = pool.spawn(receiver.collect());
 
         core.handle().spawn(
