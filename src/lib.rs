@@ -6,6 +6,7 @@ extern crate tokio_core;
 use std::fmt;
 
 use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
+use futures::future;
 
 use tokio_core::reactor::Core;
 
@@ -117,12 +118,12 @@ impl Testable for () {
 
 impl<T> Testable for fn() -> T
 where
-    T: Testable,
+    T: Testable + 'static,
 {
     type Error = T::Error;
 
     fn test(self) -> TestFuture<Self::Error> {
-        self().test()
+        Box::new(future::lazy(move || self().test()))
     }
 }
 
