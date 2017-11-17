@@ -4,6 +4,7 @@ extern crate num_cpus;
 extern crate tokio_core;
 
 use std::fmt;
+use std::ops::{Add, AddAssign};
 
 use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
 use futures::future::{self, Either};
@@ -178,6 +179,29 @@ pub enum TestProgress<Error> {
     Test(String, Result<(), Error>),
 }
 
+#[derive(Default)]
+struct Stats {
+    failed_tests: i32,
+    successful_tests: i32,
+}
+
+impl AddAssign for Stats {
+    fn add_assign(&mut self, other: Stats) {
+        self.failed_tests += other.failed_tests;
+        self.successful_tests += other.successful_tests;
+    }
+}
+
+impl Add for Stats {
+    type Output = Self;
+
+    fn add(mut self, other: Stats) -> Self {
+        self += other;
+        self
+    }
+}
+
+
 impl<Error> RunningTest<Error>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -186,27 +210,31 @@ where
         mut tests: Vec<RunningTest<Error>>,
         path: String,
         sink: S,
-    ) -> Box<Future<Item = S, Error = ()>>
+    ) -> Box<Future<Item = (Stats, S), Error = ()>>
     where
         S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
     {
         match tests.pop() {
-            Some(test) => Box::new(
-                test.print(&path, sink)
-                    .and_then(|sink| Self::print_all(tests, path, sink)),
-            ),
-            None => Box::new(Ok(sink).into_future()),
+            Some(test) => Box::new(test.print(&path, sink).and_then(|(s1, sink)| {
+                Self::print_all(tests, path, sink).map(|(s2, sink)| (s1 + s2, sink))
+            })),
+            None => Box::new(Ok((Stats::default(), sink)).into_future()),
         }
     }
 
-    fn print<S>(self, path: &str, sink: S) -> Box<Future<Item = S, Error = ()>>
+    fn print<S>(self, path: &str, sink: S) -> Box<Future<Item = (Stats, S), Error = ()>>
     where
         S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
     {
         match self {
-            RunTest::Test { name, test } => {
-                Box::new(test.then(move |result| sink.send(TestProgress::Test(name, result))))
-            }
+            RunTest::Test { name, test } => Box::new(test.then(move |result| {
+                let stats = Stats {
+                    successful_tests: result.is_ok() as i32,
+                    failed_tests: result.is_err() as i32,
+                };
+                sink.send(TestProgress::Test(name, result))
+                    .map(|sink| (stats, sink))
+            })),
             RunTest::Group { name, mut tests } => {
                 tests.reverse();
                 let owned_path = if path == "" {
@@ -217,7 +245,9 @@ where
                 Box::new(
                     sink.send(TestProgress::GroupStart(name.into()))
                         .and_then(|sink| Self::print_all(tests, owned_path, sink))
-                        .and_then(|sink| sink.send(TestProgress::GroupEnd)),
+                        .and_then(|(stats, sink)| {
+                            sink.send(TestProgress::GroupEnd).map(|sink| (stats, sink))
+                        }),
                 )
             }
         }
@@ -277,7 +307,20 @@ where
     let running_test = test.run_all(&pool);
 
     let mut core = Core::new().unwrap();
-    core.run(running_test.print("", sink).map(|_| ()))
+    let (stats, _) = core.run(running_test.print("", sink))?;
+
+    let overall_result = if stats.failed_tests == 0 {
+        "ok"
+    } else {
+        "FAILED"
+    };
+    println!(
+        "test result: {}. {} passed; {} failed",
+        overall_result,
+        stats.successful_tests,
+        stats.failed_tests
+    );
+    Ok(())
 }
 
 #[cfg(test)]
