@@ -6,7 +6,7 @@ extern crate tokio_core;
 use std::fmt;
 
 use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
-use futures::future;
+use futures::future::{self, Either};
 
 use tokio_core::reactor::Core;
 
@@ -119,11 +119,26 @@ impl Testable for () {
 impl<T> Testable for fn() -> T
 where
     T: Testable + 'static,
+    T::Error: for<'a> From<&'a str> + From<String> + Send + Sync,
 {
     type Error = T::Error;
 
     fn test(self) -> TestFuture<Self::Error> {
-        Box::new(future::lazy(move || self().test()))
+        Box::new(future::lazy(move || {
+            let result = ::std::panic::catch_unwind(|| self().test());
+            match result {
+                Ok(fut) => Either::A(fut),
+                Err(err) => Either::B(
+                    Err(
+                        err.downcast::<T::Error>()
+                            .map(|err| *err)
+                            .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
+                            .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
+                            .unwrap_or_else(|_| panic!("Unknown panic type")),
+                    ).into_future(),
+                ),
+            }
+        }))
     }
 }
 
@@ -354,6 +369,26 @@ mod tests {
                 TestProgress::Test("middle test".to_string(), Ok(())),
                 TestProgress::GroupStart("inner2".into()),
                 TestProgress::GroupEnd,
+                TestProgress::GroupEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn handle_panic() {
+        fn test1() {
+            panic!("fail")
+        }
+        let progress = test_test(group(
+            "group",
+            vec![tensile_fn!(test1), test("test2", true)],
+        ));
+        assert_eq!(
+            progress,
+            vec![
+                TestProgress::GroupStart("group".into()),
+                TestProgress::Test("test1".into(), Err("fail".into())),
+                TestProgress::Test("test2".into(), Ok(())),
                 TestProgress::GroupEnd,
             ]
         );
