@@ -85,7 +85,10 @@ where
 }
 
 pub enum RunTest<T> {
-    Test { name: String, test: T },
+    Test {
+        name: String,
+        test: T,
+    },
     Group {
         name: String,
         tests: Vec<RunTest<T>>,
@@ -117,8 +120,20 @@ impl Testable for () {
     }
 }
 
-impl<T> Testable for fn() -> T
+impl<E> Testable for Result<(), E>
 where
+    E: Send + Sync + 'static,
+{
+    type Error = E;
+
+    fn test(self) -> TestFuture<Self::Error> {
+        Box::new(self.into_future())
+    }
+}
+
+impl<F, T> Testable for F
+where
+    F: FnOnce() -> T + Send + Sync + ::std::panic::UnwindSafe + 'static,
     T: Testable + 'static,
     T::Error: for<'a> From<&'a str> + From<String> + Send + Sync,
 {
@@ -147,25 +162,38 @@ impl<Error> Test<Error>
 where
     Error: Send + 'static,
 {
-    fn run_all(self, cpu_pool: &CpuPool) -> RunningTest<Error> {
-        self.run_test(cpu_pool, "")
+    fn run_all(self, cpu_pool: &CpuPool, options: &Options) -> Option<RunningTest<Error>> {
+        self.run_test(cpu_pool, options, "")
     }
 
-    fn run_test(self, cpu_pool: &CpuPool, path: &str) -> RunningTest<Error> {
+    fn run_test(
+        self,
+        cpu_pool: &CpuPool,
+        options: &Options,
+        path: &str,
+    ) -> Option<RunningTest<Error>> {
         match self {
-            Test::Test { name, test } => RunTest::Test {
-                name,
-                test: Box::new(cpu_pool.spawn(test.test())),
-            },
+            Test::Test { name, test } => {
+                let test_path = format!("{}/{}", path, name);
+                if test_path.contains(&options.filter) {
+                    Some(RunTest::Test {
+                        name,
+                        test: Box::new(cpu_pool.spawn(test.test())),
+                    })
+                } else {
+                    None
+                }
+            }
             Test::Group { name, tests } => {
                 let test_path = format!("{}/{}", path, name);
-
-                RunTest::Group {
-                    name: name,
-                    tests: tests
-                        .into_iter()
-                        .map(|test| test.run_test(cpu_pool, &test_path))
-                        .collect(),
+                let tests: Vec<_> = tests
+                    .into_iter()
+                    .filter_map(|test| test.run_test(cpu_pool, options, &test_path))
+                    .collect();
+                if tests.is_empty() {
+                    None
+                } else {
+                    Some(RunTest::Group { name, tests })
                 }
             }
         }
@@ -254,15 +282,17 @@ where
     }
 }
 
-struct Console<T>(::std::marker::PhantomData<T>);
-impl<T> Default for Console<T>
+struct Console<T>(::std::marker::PhantomData<T>, Output);
+
+impl<T> Console<T>
 where
     T: fmt::Display,
 {
-    fn default() -> Self {
-        Console(::std::marker::PhantomData)
+    fn new(output: Output) -> Self {
+        Console(::std::marker::PhantomData, output)
     }
 }
+
 impl<T> Sink for Console<T>
 where
     T: fmt::Display,
@@ -271,7 +301,10 @@ where
     type SinkError = ();
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        println!("{}", item);
+        match self.1 {
+            Output::Stdout => println!("{}", item),
+            Output::Stderr => eprintln!("{}", item),
+        }
         Ok(AsyncSink::Ready)
     }
 
@@ -280,16 +313,60 @@ where
     }
 }
 
-pub fn console_runner<Error>(test: Test<Error>) -> Result<(), ()>
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Output {
+    Stdout,
+    Stderr,
+}
+
+impl Default for Output {
+    fn default() -> Output {
+        Output::Stdout
+    }
+}
+
+#[derive(Default)]
+pub struct Options {
+    filter: String,
+    jobs: Option<usize>,
+    output: Output,
+}
+
+impl Options {
+    pub fn new() -> Options {
+        Options::default()
+    }
+
+    pub fn filter<S>(mut self, filter: S) -> Options
+    where
+        S: Into<String>,
+    {
+        self.filter = filter.into();
+        self
+    }
+
+    pub fn jobs(mut self, jobs: Option<usize>) -> Options {
+        self.jobs = jobs;
+        self
+    }
+
+    pub fn output(mut self, output: Output) -> Options {
+        self.output = output;
+        self
+    }
+}
+
+pub fn console_runner<Error>(test: Test<Error>, options: &Options) -> Result<(), ()>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let mut indent = String::new();
-    let sink = Console::default().with(move |progress| {
+    let sink = Console::new(options.output).with(move |progress| {
         Ok(match progress {
             TestProgress::GroupStart(name) => {
+                let msg = format!("{}GROUP: {}", indent, name);
                 indent.push('\t');
-                format!("GROUP: {}", name)
+                msg
             }
             TestProgress::GroupEnd => {
                 indent.pop();
@@ -302,12 +379,17 @@ where
         })
     });
 
-    // Add one for the console output thread which wont consume much cpu
-    let pool = CpuPool::new(num_cpus::get() + 1);
-    let running_test = test.run_all(&pool);
+    let pool = futures_cpupool::Builder::new()
+        .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
+        .name_prefix("tensile-test-pool-")
+        .create();
+    let running_test = test.run_all(&pool, options);
 
     let mut core = Core::new().unwrap();
-    let (stats, _) = core.run(running_test.print("", sink))?;
+    let stats = match running_test {
+        Some(running_test) => core.run(running_test.print("", sink))?.0,
+        None => Stats::default(),
+    };
 
     let overall_result = if stats.failed_tests == 0 {
         "ok"
@@ -320,7 +402,11 @@ where
         stats.successful_tests,
         stats.failed_tests
     );
-    Ok(())
+    if stats.failed_tests == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 #[cfg(test)]
@@ -336,22 +422,34 @@ mod tests {
     where
         Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
     {
+        options_test(test, Options::default())
+    }
+
+    fn options_test<Error>(test: Test<Error>, options: Options) -> Vec<TestProgress<Error>>
+    where
+        Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    {
         let pool = CpuPool::new(4);
-        let running_test = test.run_all(&pool);
+        let running_test = test.run_all(&pool, &options);
 
         let mut core = Core::new().unwrap();
 
         let (sender, receiver) = channel(10);
         let collector_future = pool.spawn(receiver.collect());
 
-        core.handle().spawn(
-            running_test
-                .print("", sender.sink_map_err(|_| panic!()))
-                .map(|_| ())
-                .map_err(|_| ()),
-        );
+        match running_test {
+            Some(running_test) => {
+                core.handle().spawn(
+                    running_test
+                        .print("", sender.sink_map_err(|_| panic!()))
+                        .map(|_| ())
+                        .map_err(|_| ()),
+                );
 
-        core.run(collector_future).unwrap()
+                core.run(collector_future).unwrap()
+            }
+            None => vec![],
+        }
     }
 
     #[test]
@@ -385,8 +483,6 @@ mod tests {
             vec![
                 TestProgress::GroupStart("group".into()),
                 TestProgress::Test("1".into(), Ok(())),
-                TestProgress::GroupStart("inner".into()),
-                TestProgress::GroupEnd,
                 TestProgress::GroupEnd,
             ]
         );
@@ -399,7 +495,7 @@ mod tests {
             vec![
                 group("inner1", vec![test("test1", true)]),
                 test("middle test", true),
-                group("inner2", vec![]),
+                group("inner2", vec![test("test2", false)]),
             ],
         ));
         assert_eq!(
@@ -411,6 +507,7 @@ mod tests {
                 TestProgress::GroupEnd,
                 TestProgress::Test("middle test".to_string(), Ok(())),
                 TestProgress::GroupStart("inner2".into()),
+                TestProgress::Test("test2".into(), Err("false".into())),
                 TestProgress::GroupEnd,
                 TestProgress::GroupEnd,
             ]
@@ -432,6 +529,33 @@ mod tests {
                 TestProgress::GroupStart("group".into()),
                 TestProgress::Test("test1".into(), Err("fail".into())),
                 TestProgress::Test("test2".into(), Ok(())),
+                TestProgress::GroupEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn filter() {
+        let progress = options_test(
+            group(
+                "group",
+                vec![
+                    group("inner1", vec![test("test1", true)]),
+                    test("middle test", true),
+                    group("inner2", vec![]),
+                ],
+            ),
+            Options {
+                filter: "test1".into(),
+            },
+        );
+        assert_eq!(
+            progress,
+            vec![
+                TestProgress::GroupStart("group".into()),
+                TestProgress::GroupStart("inner1".into()),
+                TestProgress::Test("test1".into(), Ok(())),
+                TestProgress::GroupEnd,
                 TestProgress::GroupEnd,
             ]
         );

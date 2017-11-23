@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate tensile;
 
-use tensile::{console_runner, group};
+use tensile::{console_runner, group, Options};
 
 
 fn test1() {
@@ -14,5 +14,5 @@ fn test2() -> bool {
 
 fn main() {
     let test = group("group1", vec![tensile_fn!(test1), tensile_fn!(test2)]);
-    console_runner(test).unwrap();
+    console_runner(test, &Options::new()).unwrap();
 }
