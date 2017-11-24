@@ -282,14 +282,14 @@ where
     }
 }
 
-struct Console<T>(::std::marker::PhantomData<T>, Output);
+struct Console<T>(::std::marker::PhantomData<T>);
 
 impl<T> Console<T>
 where
     T: fmt::Display,
 {
-    fn new(output: Output) -> Self {
-        Console(::std::marker::PhantomData, output)
+    fn new() -> Self {
+        Console(::std::marker::PhantomData)
     }
 }
 
@@ -301,10 +301,7 @@ where
     type SinkError = ();
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        match self.1 {
-            Output::Stdout => println!("{}", item),
-            Output::Stderr => eprintln!("{}", item),
-        }
+        println!("{}", item);
         Ok(AsyncSink::Ready)
     }
 
@@ -313,23 +310,10 @@ where
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Output {
-    Stdout,
-    Stderr,
-}
-
-impl Default for Output {
-    fn default() -> Output {
-        Output::Stdout
-    }
-}
-
 #[derive(Default)]
 pub struct Options {
     filter: String,
     jobs: Option<usize>,
-    output: Output,
 }
 
 impl Options {
@@ -349,11 +333,6 @@ impl Options {
         self.jobs = jobs;
         self
     }
-
-    pub fn output(mut self, output: Output) -> Options {
-        self.output = output;
-        self
-    }
 }
 
 pub fn console_runner<Error>(test: Test<Error>, options: &Options) -> Result<(), ()>
@@ -361,7 +340,7 @@ where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let mut indent = String::new();
-    let sink = Console::new(options.output).with(move |progress| {
+    let sink = Console::new().with(move |progress| {
         Ok(match progress {
             TestProgress::GroupStart(name) => {
                 let msg = format!("{}GROUP: {}", indent, name);
