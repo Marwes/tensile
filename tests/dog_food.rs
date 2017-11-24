@@ -14,5 +14,5 @@ fn test2() -> bool {
 
 fn main() {
     let test = group("group1", vec![tensile_fn!(test1), tensile_fn!(test2)]);
-    console_runner(test, &Options::new()).unwrap();
+    console_runner(test, &Options::new()).unwrap_err();
 }

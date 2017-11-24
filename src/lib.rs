@@ -2,6 +2,9 @@ extern crate futures;
 extern crate futures_cpupool;
 extern crate num_cpus;
 extern crate tokio_core;
+extern crate structopt;
+#[macro_use]
+extern crate structopt_derive;
 
 use std::fmt;
 use std::ops::{Add, AddAssign};
@@ -310,10 +313,12 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Default, StructOpt)]
 pub struct Options {
-    filter: String,
+    #[structopt(short = "j", long = "jobs", help = "Number of tests to run in parallel")]
     jobs: Option<usize>,
+    #[structopt(help = "String used to filter out tests")]
+    filter: String,
 }
 
 impl Options {
@@ -526,6 +531,7 @@ mod tests {
             ),
             Options {
                 filter: "test1".into(),
+                jobs: Some(1),
             },
         );
         assert_eq!(
