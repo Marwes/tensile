@@ -425,7 +425,9 @@ where
         report.failed_tests,
         report.filtered_tests
     );
-    if report.failed_tests == 0 {
+    // Filtering out all tests is almost certainly a mistake so report that as an error
+    let filtered_all_tests = report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
+    if report.failed_tests == 0 && !filtered_all_tests {
         Ok(())
     } else {
         Err(())
