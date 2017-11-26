@@ -161,27 +161,42 @@ where
     }
 }
 
+struct Starter<'a> {
+    cpu_pool: &'a CpuPool,
+    options: &'a Options,
+    filtered_tests: i32,
+}
+
+impl<'a> Starter<'a> {
+    fn new(cpu_pool: &'a CpuPool, options: &'a Options) -> Starter<'a> {
+        Starter {
+            cpu_pool,
+            options,
+            filtered_tests: 0,
+        }
+    }
+}
+
 impl<Error> Test<Error>
 where
     Error: Send + 'static,
 {
-    fn run_all(self, cpu_pool: &CpuPool, options: &Options) -> Option<RunningTest<Error>> {
-        self.run_test(cpu_pool, options, "")
+    fn run_all(self, starter: &mut Starter) -> Option<RunningTest<Error>> {
+        self.run_test(starter, "")
     }
 
     fn run_test(
         self,
-        cpu_pool: &CpuPool,
-        options: &Options,
+        starter: &mut Starter,
         path: &str,
     ) -> Option<RunningTest<Error>> {
         match self {
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
-                if test_path.contains(&options.filter) {
+                if test_path.contains(&starter.options.filter) {
                     Some(RunTest::Test {
                         name,
-                        test: Box::new(cpu_pool.spawn(test.test())),
+                        test: Box::new(starter.cpu_pool.spawn(test.test())),
                     })
                 } else {
                     None
@@ -191,7 +206,7 @@ where
                 let test_path = format!("{}/{}", path, name);
                 let tests: Vec<_> = tests
                     .into_iter()
-                    .filter_map(|test| test.run_test(cpu_pool, options, &test_path))
+                    .filter_map(|test| test.run_test(starter, &test_path))
                     .collect();
                 if tests.is_empty() {
                     None
@@ -340,6 +355,39 @@ impl Options {
     }
 }
 
+struct TestReport {
+    failed_tests: i32,
+    successful_tests: i32,
+    filtered_tests: i32,
+}
+
+fn execute_test_runner<S, Error>(sink: S, test: Test<Error>, options: &Options) -> Result<TestReport, ()>
+where
+    S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
+    Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+
+    let pool = futures_cpupool::Builder::new()
+        .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
+        .name_prefix("tensile-test-pool-")
+        .create();
+
+    let mut starter = Starter::new(&pool, options);
+    let running_test = test.run_all(&mut starter);
+
+    let mut core = Core::new().unwrap();
+    let stats = match running_test {
+        Some(running_test) => core.run(running_test.print("", sink))?.0,
+        None => Stats::default(),
+    };
+
+    Ok(TestReport {
+        failed_tests: stats.failed_tests,
+        successful_tests: stats.successful_tests,
+        filtered_tests: starter.filtered_tests,
+    })
+}
+
 pub fn console_runner<Error>(test: Test<Error>, options: &Options) -> Result<(), ()>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -363,30 +411,21 @@ where
         })
     });
 
-    let pool = futures_cpupool::Builder::new()
-        .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
-        .name_prefix("tensile-test-pool-")
-        .create();
-    let running_test = test.run_all(&pool, options);
+    let report = execute_test_runner(sink, test, options)?;
 
-    let mut core = Core::new().unwrap();
-    let stats = match running_test {
-        Some(running_test) => core.run(running_test.print("", sink))?.0,
-        None => Stats::default(),
-    };
-
-    let overall_result = if stats.failed_tests == 0 {
+    let overall_result = if report.failed_tests == 0 {
         "ok"
     } else {
         "FAILED"
     };
     println!(
-        "test result: {}. {} passed; {} failed",
+        "test result: {}. {} passed; {} failed; {} filtered",
         overall_result,
-        stats.successful_tests,
-        stats.failed_tests
+        report.successful_tests,
+        report.failed_tests,
+        report.filtered_tests
     );
-    if stats.failed_tests == 0 {
+    if report.failed_tests == 0 {
         Ok(())
     } else {
         Err(())
@@ -414,7 +453,7 @@ mod tests {
         Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
     {
         let pool = CpuPool::new(4);
-        let running_test = test.run_all(&pool, &options);
+        let running_test = test.run_all(&mut Starter::new(&pool, &options));
 
         let mut core = Core::new().unwrap();
 
