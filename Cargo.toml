@@ -3,6 +3,14 @@ name = "tensile"
 version = "0.1.0"
 authors = ["Markus Westerlind <marwes91@gmail.com>"]
 
+license = "MIT"
+
+description = "A static, type inferred programming language for application embedding"
+
+repository = "https://github.com/Marwes/tensile"
+documentation = "https://docs.rs/tensile"
+readme = "README.md"
+
 [dependencies]
 futures = "0.1"
 tokio-core = "0.1"
