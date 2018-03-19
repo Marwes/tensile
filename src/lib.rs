@@ -1,15 +1,19 @@
 extern crate futures;
 extern crate futures_cpupool;
 extern crate num_cpus;
-extern crate tokio_core;
 extern crate structopt;
 #[macro_use]
 extern crate structopt_derive;
+extern crate termcolor;
+extern crate tokio_core;
 
+use std::io::{self, Write};
 use std::fmt;
 use std::ops::{Add, AddAssign};
 
-use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
+use termcolor::WriteColor;
+
+use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
 use futures::future::{self, Either};
 
 use tokio_core::reactor::Core;
@@ -17,7 +21,6 @@ use tokio_core::reactor::Core;
 use futures_cpupool::CpuPool;
 
 pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + Sync + 'static>;
-
 
 pub trait Testable {
     type Error;
@@ -148,13 +151,12 @@ where
             match result {
                 Ok(fut) => Either::A(fut),
                 Err(err) => Either::B(
-                    Err(
-                        err.downcast::<T::Error>()
-                            .map(|err| *err)
-                            .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
-                            .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
-                            .unwrap_or_else(|_| panic!("Unknown panic type")),
-                    ).into_future(),
+                    Err(err.downcast::<T::Error>()
+                        .map(|err| *err)
+                        .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
+                        .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
+                        .unwrap_or_else(|_| panic!("Unknown panic type")))
+                        .into_future(),
                 ),
             }
         }))
@@ -185,11 +187,7 @@ where
         self.run_test(starter, "")
     }
 
-    fn run_test(
-        self,
-        starter: &mut Starter,
-        path: &str,
-    ) -> Option<RunningTest<Error>> {
+    fn run_test(self, starter: &mut Starter, path: &str) -> Option<RunningTest<Error>> {
         match self {
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
@@ -247,7 +245,6 @@ impl Add for Stats {
     }
 }
 
-
 impl<Error> RunningTest<Error>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -256,9 +253,9 @@ where
         mut tests: Vec<RunningTest<Error>>,
         path: String,
         sink: S,
-    ) -> Box<Future<Item = (Stats, S), Error = ()>>
+    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError>>
     where
-        S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
+        S: Sink<SinkItem = TestProgress<Error>> + 'static,
     {
         match tests.pop() {
             Some(test) => Box::new(test.print(&path, sink).and_then(|(s1, sink)| {
@@ -268,9 +265,9 @@ where
         }
     }
 
-    fn print<S>(self, path: &str, sink: S) -> Box<Future<Item = (Stats, S), Error = ()>>
+    fn print<S>(self, path: &str, sink: S) -> Box<Future<Item = (Stats, S), Error = S::SinkError>>
     where
-        S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
+        S: Sink<SinkItem = TestProgress<Error>> + 'static,
     {
         match self {
             RunTest::Test { name, test } => Box::new(test.then(move |result| {
@@ -300,26 +297,49 @@ where
     }
 }
 
-struct Console<T>(::std::marker::PhantomData<T>);
+struct Console<W, T> {
+    writer: W,
+    _marker: ::std::marker::PhantomData<T>,
+}
 
-impl<T> Console<T>
+impl<W, T> Console<W, T>
 where
+    W: termcolor::WriteColor,
     T: fmt::Display,
 {
-    fn new() -> Self {
-        Console(::std::marker::PhantomData)
+    fn new(writer: W) -> Self {
+        Console {
+            writer,
+            _marker: ::std::marker::PhantomData,
+        }
     }
 }
 
-impl<T> Sink for Console<T>
+struct Colored<T> {
+    color: Option<termcolor::ColorSpec>,
+    msg: T,
+}
+
+impl<T> From<T> for Colored<T> {
+    fn from(msg: T) -> Self {
+        Colored { color: None, msg }
+    }
+}
+
+impl<W, T> Sink for Console<W, T>
 where
+    W: termcolor::WriteColor,
     T: fmt::Display,
 {
-    type SinkItem = T;
-    type SinkError = ();
+    type SinkItem = Colored<T>;
+    type SinkError = io::Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        println!("{}", item);
+        match item.color {
+            Some(color) => self.writer.set_color(&color)?,
+            None => self.writer.reset()?,
+        }
+        write!(self.writer, "{}", item.msg)?;
         Ok(AsyncSink::Ready)
     }
 
@@ -334,6 +354,30 @@ pub struct Options {
     jobs: Option<usize>,
     #[structopt(help = "String used to filter out tests")]
     filter: String,
+    #[structopt(help = "Coloring: auto, always, always-ansi, never", parse(try_from_str))]
+    color: Color,
+}
+
+struct Color(termcolor::ColorChoice);
+
+impl Default for Color {
+    fn default() -> Color {
+        Color(termcolor::ColorChoice::Auto)
+    }
+}
+
+impl ::std::str::FromStr for Color {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use termcolor::ColorChoice::*;
+        Ok(Color(match s {
+            "auto" => Auto,
+            "always" => Always,
+            "always-ansi" => AlwaysAnsi,
+            "never" => Never,
+            _ => return Err("Expected on of auto, always, always-ansi, never"),
+        }))
+    }
 }
 
 impl Options {
@@ -353,6 +397,11 @@ impl Options {
         self.jobs = jobs;
         self
     }
+
+    pub fn color(mut self, color: termcolor::ColorChoice) -> Options {
+        self.color = Color(color);
+        self
+    }
 }
 
 struct TestReport {
@@ -361,12 +410,15 @@ struct TestReport {
     filtered_tests: i32,
 }
 
-fn execute_test_runner<S, Error>(sink: S, test: Test<Error>, options: &Options) -> Result<TestReport, ()>
+fn execute_test_runner<S, Error>(
+    sink: S,
+    test: Test<Error>,
+    options: &Options,
+) -> Result<TestReport, S::SinkError>
 where
-    S: Sink<SinkItem = TestProgress<Error>, SinkError = ()> + 'static,
+    S: Sink<SinkItem = TestProgress<Error>> + 'static,
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-
     let pool = futures_cpupool::Builder::new()
         .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
         .name_prefix("tensile-test-pool-")
@@ -388,49 +440,89 @@ where
     })
 }
 
-pub fn console_runner<Error>(test: Test<Error>, options: &Options) -> Result<(), ()>
+pub fn console_runner<Error>(
+    test: Test<Error>,
+    options: &Options,
+) -> Result<(), Box<::std::error::Error>>
 where
     Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let mut indent = String::new();
-    let sink = Console::new().with(move |progress| {
-        Ok(match progress {
-            TestProgress::GroupStart(name) => {
-                let msg = format!("{}GROUP: {}", indent, name);
-                indent.push('\t');
-                msg
-            }
-            TestProgress::GroupEnd => {
-                indent.pop();
-                "".to_string()
-            }
-            TestProgress::Test(name, result) => match result {
-                Ok(()) => format!("{}PASSED: {}", indent, name),
-                Err(err) => format!("{}FAILED: {}\n{}", indent, name, err),
-            },
-        })
-    });
+    let sink = Console::new(termcolor::StandardStream::stdout(options.color.0)).with_flat_map(
+        move |progress| {
+            let cmds = match progress {
+                TestProgress::GroupStart(name) => {
+                    let msg = format!("{}{}\n", indent, name);
+                    indent.push('\t');
+                    vec![
+                        Colored {
+                            color: Some(termcolor::ColorSpec::new().set_bold(true).clone()),
+                            msg,
+                        },
+                    ]
+                }
+                TestProgress::GroupEnd => {
+                    indent.pop();
+                    vec![Colored::from("\n".to_string())]
+                }
+                TestProgress::Test(name, result) => {
+                    let name = Colored::from(format!("{}{} ... ", indent, name));
+                    match result {
+                        Ok(()) => vec![
+                            name,
+                            Colored {
+                                color: Some(
+                                    termcolor::ColorSpec::new()
+                                        .set_fg(Some(termcolor::Color::Green))
+                                        .clone(),
+                                ),
+                                msg: "ok".to_string(),
+                            },
+                            Colored::from("\n".to_string()),
+                        ],
+                        Err(err) => vec![
+                            name,
+                            Colored {
+                                color: Some(
+                                    termcolor::ColorSpec::new()
+                                        .set_fg(Some(termcolor::Color::Red))
+                                        .clone(),
+                                ),
+                                msg: "FAILED".to_string(),
+                            },
+                            Colored::from(format!("\n{}", err)),
+                        ],
+                    }
+                }
+            };
+            stream::iter_ok(cmds)
+        },
+    );
 
     let report = execute_test_runner(sink, test, options)?;
 
-    let overall_result = if report.failed_tests == 0 {
-        "ok"
+    let mut writer = termcolor::StandardStream::stdout(options.color.0);
+    write!(writer, "test result: ")?;
+    if report.failed_tests == 0 {
+        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
+        write!(writer, "ok")?;
     } else {
-        "FAILED"
-    };
-    println!(
-        "test result: {}. {} passed; {} failed; {} filtered",
-        overall_result,
-        report.successful_tests,
-        report.failed_tests,
-        report.filtered_tests
-    );
+        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
+        write!(writer, "FAILED")?;
+    }
+    writer.reset()?;
+    writeln!(
+        writer,
+        ". {} passed; {} failed; {} filtered",
+        report.successful_tests, report.failed_tests, report.filtered_tests
+    )?;
     // Filtering out all tests is almost certainly a mistake so report that as an error
-    let filtered_all_tests = report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
+    let filtered_all_tests =
+        report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
     if report.failed_tests == 0 && !filtered_all_tests {
         Ok(())
     } else {
-        Err(())
+        Err("One or more tests failed".into())
     }
 }
 
@@ -573,6 +665,7 @@ mod tests {
             Options {
                 filter: "test1".into(),
                 jobs: Some(1),
+                color: Color(termcolor::ColorChoice::Never),
             },
         );
         assert_eq!(
