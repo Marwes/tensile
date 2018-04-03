@@ -7,14 +7,14 @@ extern crate structopt_derive;
 extern crate termcolor;
 extern crate tokio_core;
 
-use std::io::{self, Write};
 use std::fmt;
+use std::io::{self, Write};
 use std::ops::{Add, AddAssign};
 
 use termcolor::WriteColor;
 
-use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
 use futures::future::{self, Either};
+use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
 
 use tokio_core::reactor::Core;
 
@@ -75,9 +75,9 @@ where
 
 #[macro_export]
 macro_rules! tensile_fn {
-    ($name: ident) => {
+    ($name:ident) => {
         $crate::test(stringify!($name), $name as fn() -> _)
-    }
+    };
 }
 
 pub fn group<S, Error>(name: S, tests: Vec<Test<Error>>) -> Test<Error>
@@ -197,6 +197,7 @@ where
                         test: Box::new(starter.cpu_pool.spawn(test.test())),
                     })
                 } else {
+                    self.filtered_tests += 1;
                     None
                 }
             }
