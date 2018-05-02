@@ -20,14 +20,14 @@ use tokio_core::reactor::Core;
 
 use futures_cpupool::CpuPool;
 
-pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + Sync + 'static>;
+pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + 'static>;
 
-pub trait Testable {
+pub trait Testable: Send {
     type Error;
     fn test(self) -> TestFuture<Self::Error>;
 }
 
-pub trait BoxTestable {
+pub trait BoxTestable: Send {
     type Error;
     fn test_box(self: Box<Self>) -> TestFuture<Self::Error>;
 }
@@ -65,7 +65,7 @@ pub enum Test<Error> {
 pub fn test<S, T>(name: S, testable: T) -> Test<T::Error>
 where
     S: Into<String>,
-    T: Testable + Send + Sync + 'static,
+    T: Testable + Send + 'static,
 {
     Test::Test {
         name: name.into(),
@@ -128,7 +128,7 @@ impl Testable for () {
 
 impl<E> Testable for Result<(), E>
 where
-    E: Send + Sync + 'static,
+    E: Send + 'static,
 {
     type Error = E;
 
@@ -139,9 +139,9 @@ where
 
 impl<F, T> Testable for F
 where
-    F: FnOnce() -> T + Send + Sync + ::std::panic::UnwindSafe + 'static,
+    F: FnOnce() -> T + Send + ::std::panic::UnwindSafe + 'static,
     T: Testable + 'static,
-    T::Error: for<'a> From<&'a str> + From<String> + Send + Sync,
+    T::Error: for<'a> From<&'a str> + From<String> + Send,
 {
     type Error = T::Error;
 
@@ -197,7 +197,7 @@ where
                         test: Box::new(starter.cpu_pool.spawn(test.test())),
                     })
                 } else {
-                    self.filtered_tests += 1;
+                    starter.filtered_tests += 1;
                     None
                 }
             }
@@ -248,7 +248,7 @@ impl Add for Stats {
 
 impl<Error> RunningTest<Error>
 where
-    Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    Error: fmt::Debug + fmt::Display + Send + 'static,
 {
     fn print_all<S>(
         mut tests: Vec<RunningTest<Error>>,
@@ -418,7 +418,7 @@ fn execute_test_runner<S, Error>(
 ) -> Result<TestReport, S::SinkError>
 where
     S: Sink<SinkItem = TestProgress<Error>> + 'static,
-    Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    Error: fmt::Debug + fmt::Display + Send + 'static,
 {
     let pool = futures_cpupool::Builder::new()
         .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
@@ -446,7 +446,7 @@ pub fn console_runner<Error>(
     options: &Options,
 ) -> Result<(), Box<::std::error::Error>>
 where
-    Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    Error: fmt::Debug + fmt::Display + Send + 'static,
 {
     let mut indent = String::new();
     let sink = Console::new(termcolor::StandardStream::stdout(options.color.0)).with_flat_map(
@@ -538,14 +538,14 @@ mod tests {
 
     fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
     where
-        Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+        Error: fmt::Debug + fmt::Display + Send + 'static,
     {
         options_test(test, Options::default())
     }
 
     fn options_test<Error>(test: Test<Error>, options: Options) -> Vec<TestProgress<Error>>
     where
-        Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+        Error: fmt::Debug + fmt::Display + Send + 'static,
     {
         let pool = CpuPool::new(4);
         let running_test = test.run_all(&mut Starter::new(&pool, &options));
