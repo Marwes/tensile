@@ -1,3 +1,4 @@
+extern crate failure;
 extern crate futures;
 extern crate futures_cpupool;
 extern crate num_cpus;
@@ -260,7 +261,7 @@ where
             Some(test) => Box::new(test.print(&path, sink).and_then(|(s1, sink)| {
                 Self::print_all(tests, path, sink).map(|(s2, sink)| (s1 + s2, sink))
             })),
-            None => Box::new(Ok((Stats::default(), sink)).into_future()),
+            None => Box::new(future::ok((Stats::default(), sink))),
         }
     }
 
@@ -441,7 +442,7 @@ where
 pub fn console_runner<Error>(
     test: Test<Error>,
     options: &Options,
-) -> impl Future<Item = (), Error = Box<::std::error::Error>>
+) -> impl Future<Item = (), Error = failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
@@ -498,7 +499,7 @@ where
 
     execute_test_runner(sink, test, options)
         .from_err()
-        .and_then(move |report| -> Result<_, Box<std::error::Error>> {
+        .and_then(move |report| -> Result<_, failure::Error> {
             let mut writer = termcolor::StandardStream::stdout(color);
             write!(writer, "test result: ")?;
             if report.failed_tests == 0 {
@@ -522,7 +523,7 @@ where
             if report.failed_tests == 0 && !filtered_all_tests {
                 Ok(())
             } else {
-                Err("One or more tests failed".into())
+                Err(failure::err_msg("One or more tests failed"))
             }
         })
 }
