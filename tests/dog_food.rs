@@ -1,8 +1,9 @@
 #[macro_use]
 extern crate tensile;
+extern crate futures;
 
+use futures::Future;
 use tensile::{console_runner, group, Options};
-
 
 fn test1() {
     assert!(true);
@@ -14,5 +15,6 @@ fn test2() -> bool {
 
 fn main() {
     let test = group("group1", vec![tensile_fn!(test1), tensile_fn!(test2)]);
-    console_runner(test, &Options::new()).unwrap_err();
+    let options = Options::new();
+    console_runner(test, &options).wait().unwrap_err();
 }

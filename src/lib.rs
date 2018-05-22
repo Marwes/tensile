@@ -5,7 +5,6 @@ extern crate structopt;
 #[macro_use]
 extern crate structopt_derive;
 extern crate termcolor;
-extern crate tokio_core;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -15,8 +14,6 @@ use termcolor::WriteColor;
 
 use futures::future::{self, Either};
 use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
-
-use tokio_core::reactor::Core;
 
 use futures_cpupool::CpuPool;
 
@@ -151,7 +148,8 @@ where
             match result {
                 Ok(fut) => Either::A(fut),
                 Err(err) => Either::B(
-                    Err(err.downcast::<T::Error>()
+                    Err(err
+                        .downcast::<T::Error>()
                         .map(|err| *err)
                         .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
                         .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
@@ -415,7 +413,7 @@ fn execute_test_runner<S, Error>(
     sink: S,
     test: Test<Error>,
     options: &Options,
-) -> Result<TestReport, S::SinkError>
+) -> impl Future<Item = TestReport, Error = S::SinkError>
 where
     S: Sink<SinkItem = TestProgress<Error>> + 'static,
     Error: fmt::Debug + fmt::Display + Send + 'static,
@@ -428,39 +426,38 @@ where
     let mut starter = Starter::new(&pool, options);
     let running_test = test.run_all(&mut starter);
 
-    let mut core = Core::new().unwrap();
     let stats = match running_test {
-        Some(running_test) => core.run(running_test.print("", sink))?.0,
-        None => Stats::default(),
+        Some(running_test) => Either::A(running_test.print("", sink).from_err().map(|t| t.0)),
+        None => Either::B(future::ok(Stats::default())),
     };
-
-    Ok(TestReport {
+    let filtered_tests = starter.filtered_tests;
+    stats.map(move |stats| TestReport {
         failed_tests: stats.failed_tests,
         successful_tests: stats.successful_tests,
-        filtered_tests: starter.filtered_tests,
+        filtered_tests,
     })
 }
 
 pub fn console_runner<Error>(
     test: Test<Error>,
     options: &Options,
-) -> Result<(), Box<::std::error::Error>>
+) -> impl Future<Item = (), Error = Box<::std::error::Error>>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
+    let color = options.color.0;
     let mut indent = String::new();
-    let sink = Console::new(termcolor::StandardStream::stdout(options.color.0)).with_flat_map(
-        move |progress| {
+
+    let sink =
+        Console::new(termcolor::StandardStream::stdout(color)).with_flat_map(move |progress| {
             let cmds = match progress {
                 TestProgress::GroupStart(name) => {
                     let msg = format!("{}{}\n", indent, name);
                     indent.push('\t');
-                    vec![
-                        Colored {
-                            color: Some(termcolor::ColorSpec::new().set_bold(true).clone()),
-                            msg,
-                        },
-                    ]
+                    vec![Colored {
+                        color: Some(termcolor::ColorSpec::new().set_bold(true).clone()),
+                        msg,
+                    }]
                 }
                 TestProgress::GroupEnd => {
                     indent.pop();
@@ -497,44 +494,51 @@ where
                 }
             };
             stream::iter_ok(cmds)
-        },
-    );
+        });
 
-    let report = execute_test_runner(sink, test, options)?;
-
-    let mut writer = termcolor::StandardStream::stdout(options.color.0);
-    write!(writer, "test result: ")?;
-    if report.failed_tests == 0 {
-        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
-        write!(writer, "ok")?;
-    } else {
-        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
-        write!(writer, "FAILED")?;
-    }
-    writer.reset()?;
-    writeln!(
-        writer,
-        ". {} passed; {} failed; {} filtered",
-        report.successful_tests, report.failed_tests, report.filtered_tests
-    )?;
-    // Filtering out all tests is almost certainly a mistake so report that as an error
-    let filtered_all_tests =
-        report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
-    if report.failed_tests == 0 && !filtered_all_tests {
-        Ok(())
-    } else {
-        Err("One or more tests failed".into())
-    }
+    execute_test_runner(sink, test, options)
+        .from_err()
+        .and_then(move |report| -> Result<_, Box<std::error::Error>> {
+            let mut writer = termcolor::StandardStream::stdout(color);
+            write!(writer, "test result: ")?;
+            if report.failed_tests == 0 {
+                writer
+                    .set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
+                write!(writer, "ok")?;
+            } else {
+                writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
+                write!(writer, "FAILED")?;
+            }
+            writer.reset()?;
+            writeln!(
+                writer,
+                ". {} passed; {} failed; {} filtered",
+                report.successful_tests, report.failed_tests, report.filtered_tests
+            )?;
+            // Filtering out all tests is almost certainly a mistake so report that as an error
+            let filtered_all_tests = report.failed_tests == 0
+                && report.successful_tests == 0
+                && report.filtered_tests != 0;
+            if report.failed_tests == 0 && !filtered_all_tests {
+                Ok(())
+            } else {
+                Err("One or more tests failed".into())
+            }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use futures::Stream;
+    extern crate tokio;
+
     use futures::sync::mpsc::channel;
+    use futures::Stream;
 
     use futures_cpupool::CpuPool;
+
+    use self::tokio::runtime::current_thread::Runtime;
 
     fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
     where
@@ -550,21 +554,21 @@ mod tests {
         let pool = CpuPool::new(4);
         let running_test = test.run_all(&mut Starter::new(&pool, &options));
 
-        let mut core = Core::new().unwrap();
+        let mut core = Runtime::new().unwrap();
 
         let (sender, receiver) = channel(10);
         let collector_future = pool.spawn(receiver.collect());
 
         match running_test {
             Some(running_test) => {
-                core.handle().spawn(
+                core.spawn(
                     running_test
                         .print("", sender.sink_map_err(|_| panic!()))
                         .map(|_| ())
                         .map_err(|_| ()),
                 );
 
-                core.run(collector_future).unwrap()
+                core.block_on(collector_future).unwrap()
             }
             None => vec![],
         }
