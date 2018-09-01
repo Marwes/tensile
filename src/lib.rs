@@ -154,8 +154,7 @@ where
                         .map(|err| *err)
                         .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
                         .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
-                        .unwrap_or_else(|_| panic!("Unknown panic type")))
-                        .into_future(),
+                        .unwrap_or_else(|_| panic!("Unknown panic type"))).into_future(),
                 ),
             }
         }))
@@ -253,9 +252,10 @@ where
         mut tests: Vec<RunningTest<Error>>,
         path: String,
         sink: S,
-    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError>>
+    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError> + Send>
     where
-        S: Sink<SinkItem = TestProgress<Error>> + 'static,
+        S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
+        S::SinkError: Send,
     {
         match tests.pop() {
             Some(test) => Box::new(test.print(&path, sink).and_then(|(s1, sink)| {
@@ -265,9 +265,14 @@ where
         }
     }
 
-    fn print<S>(self, path: &str, sink: S) -> Box<Future<Item = (Stats, S), Error = S::SinkError>>
+    fn print<S>(
+        self,
+        path: &str,
+        sink: S,
+    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError> + Send>
     where
-        S: Sink<SinkItem = TestProgress<Error>> + 'static,
+        S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
+        S::SinkError: Send,
     {
         match self {
             RunTest::Test { name, test } => Box::new(test.then(move |result| {
@@ -350,11 +355,18 @@ where
 
 #[derive(Default, StructOpt)]
 pub struct Options {
-    #[structopt(short = "j", long = "jobs", help = "Number of tests to run in parallel")]
+    #[structopt(
+        short = "j",
+        long = "jobs",
+        help = "Number of tests to run in parallel"
+    )]
     jobs: Option<usize>,
     #[structopt(help = "String used to filter out tests")]
     filter: String,
-    #[structopt(help = "Coloring: auto, always, always-ansi, never", parse(try_from_str))]
+    #[structopt(
+        help = "Coloring: auto, always, always-ansi, never",
+        parse(try_from_str)
+    )]
     color: Color,
 }
 
@@ -416,8 +428,9 @@ fn execute_test_runner<S, Error>(
     options: &Options,
 ) -> impl Future<Item = TestReport, Error = S::SinkError>
 where
-    S: Sink<SinkItem = TestProgress<Error>> + 'static,
+    S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
     Error: fmt::Debug + fmt::Display + Send + 'static,
+    S::SinkError: Send,
 {
     let pool = futures_cpupool::Builder::new()
         .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
@@ -507,7 +520,8 @@ where
                     .set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
                 write!(writer, "ok")?;
             } else {
-                writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
+                writer
+                    .set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
                 write!(writer, "FAILED")?;
             }
             writer.reset()?;
