@@ -1,11 +1,10 @@
 extern crate failure;
 extern crate futures;
-extern crate futures_cpupool;
-extern crate num_cpus;
 extern crate structopt;
 #[macro_use]
 extern crate structopt_derive;
 extern crate termcolor;
+extern crate tokio_executor;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -15,8 +14,6 @@ use termcolor::WriteColor;
 
 use futures::future::{self, Either};
 use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
-
-use futures_cpupool::CpuPool;
 
 pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + 'static>;
 
@@ -162,15 +159,13 @@ where
 }
 
 struct Starter<'a> {
-    cpu_pool: &'a CpuPool,
     options: &'a Options,
     filtered_tests: i32,
 }
 
 impl<'a> Starter<'a> {
-    fn new(cpu_pool: &'a CpuPool, options: &'a Options) -> Starter<'a> {
+    fn new(options: &'a Options) -> Starter<'a> {
         Starter {
-            cpu_pool,
             options,
             filtered_tests: 0,
         }
@@ -190,9 +185,14 @@ where
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
                 if test_path.contains(&starter.options.filter) {
+                    let (tx, rx) = futures::sync::oneshot::channel();
+                    tokio_executor::spawn(test.test().then(|result| {
+                        tx.send(result).ok().unwrap();
+                        Ok(())
+                    }));
                     Some(RunTest::Test {
                         name,
-                        test: Box::new(starter.cpu_pool.spawn(test.test())),
+                        test: Box::new(rx.then(|result| result.unwrap())),
                     })
                 } else {
                     starter.filtered_tests += 1;
@@ -355,12 +355,6 @@ where
 
 #[derive(Default, StructOpt)]
 pub struct Options {
-    #[structopt(
-        short = "j",
-        long = "jobs",
-        help = "Number of tests to run in parallel"
-    )]
-    jobs: Option<usize>,
     #[structopt(help = "String used to filter out tests")]
     filter: String,
     #[structopt(
@@ -405,11 +399,6 @@ impl Options {
         self
     }
 
-    pub fn jobs(mut self, jobs: Option<usize>) -> Options {
-        self.jobs = jobs;
-        self
-    }
-
     pub fn color(mut self, color: termcolor::ColorChoice) -> Options {
         self.color = Color(color);
         self
@@ -432,12 +421,7 @@ where
     Error: fmt::Debug + fmt::Display + Send + 'static,
     S::SinkError: Send,
 {
-    let pool = futures_cpupool::Builder::new()
-        .pool_size(options.jobs.unwrap_or_else(|| num_cpus::get()))
-        .name_prefix("tensile-test-pool-")
-        .create();
-
-    let mut starter = Starter::new(&pool, options);
+    let mut starter = Starter::new(options);
     let running_test = test.run_all(&mut starter);
 
     let stats = match running_test {
@@ -551,8 +535,6 @@ mod tests {
     use futures::sync::mpsc::channel;
     use futures::Stream;
 
-    use futures_cpupool::CpuPool;
-
     use self::tokio::runtime::current_thread::Runtime;
 
     fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
@@ -566,27 +548,26 @@ mod tests {
     where
         Error: fmt::Debug + fmt::Display + Send + 'static,
     {
-        let pool = CpuPool::new(4);
-        let running_test = test.run_all(&mut Starter::new(&pool, &options));
-
         let mut core = Runtime::new().unwrap();
+        core.block_on(future::lazy(move || {
+            let running_test = test.run_all(&mut Starter::new(&options));
 
-        let (sender, receiver) = channel(10);
-        let collector_future = pool.spawn(receiver.collect());
+            let (sender, receiver) = channel(10);
 
-        match running_test {
-            Some(running_test) => {
-                core.spawn(
-                    running_test
-                        .print("", sender.sink_map_err(|_| panic!()))
-                        .map(|_| ())
-                        .map_err(|_| ()),
-                );
+            match running_test {
+                Some(running_test) => {
+                    tokio::spawn(
+                        running_test
+                            .print("", sender.sink_map_err(|_| panic!()))
+                            .map(|_| ())
+                            .map_err(|_| ()),
+                    );
 
-                core.block_on(collector_future).unwrap()
+                    Either::A(receiver.collect())
+                }
+                None => Either::B(future::ok(vec![])),
             }
-            None => vec![],
-        }
+        })).unwrap()
     }
 
     #[test]
@@ -684,7 +665,6 @@ mod tests {
             ),
             Options {
                 filter: "test1".into(),
-                jobs: Some(1),
                 color: Color(termcolor::ColorChoice::Never),
             },
         );

@@ -14,11 +14,11 @@ readme = "README.md"
 [dependencies]
 failure = "0.1"
 futures = "0.1"
-futures-cpupool = "0.1"
 num_cpus = "1.7.0"
 structopt = "0.2.0"
 structopt-derive = "0.2.0"
 termcolor = "0.3"
+tokio-executor = "0.1"
 
 [dev-dependencies]
 tokio = "0.1"
