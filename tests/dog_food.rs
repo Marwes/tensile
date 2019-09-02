@@ -3,7 +3,7 @@ extern crate tensile;
 extern crate futures;
 extern crate tokio;
 
-use futures::{future, Future};
+use futures::{future};
 use tensile::{console_runner, group, Options};
 
 fn test1() {

@@ -15,7 +15,7 @@ use termcolor::WriteColor;
 use futures::future::{self, Either};
 use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
 
-pub type TestFuture<E> = Box<Future<Item = (), Error = E> + Send + 'static>;
+pub type TestFuture<E> = Box<dyn Future<Item = (), Error = E> + Send + 'static>;
 
 pub trait Testable: Send {
     type Error;
@@ -27,7 +27,7 @@ pub trait BoxTestable: Send {
     fn test_box(self: Box<Self>) -> TestFuture<Self::Error>;
 }
 
-impl<Error> Testable for Box<BoxTestable<Error = Error>> {
+impl<Error> Testable for Box<dyn BoxTestable<Error = Error>> {
     type Error = Error;
 
     fn test(self) -> TestFuture<Self::Error> {
@@ -49,7 +49,7 @@ where
 pub enum Test<Error> {
     Test {
         name: String,
-        test: Box<BoxTestable<Error = Error>>,
+        test: Box<dyn BoxTestable<Error = Error>>,
     },
     Group {
         name: String,
@@ -252,7 +252,7 @@ where
         mut tests: Vec<RunningTest<Error>>,
         path: String,
         sink: S,
-    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError> + Send>
+    ) -> Box<dyn Future<Item = (Stats, S), Error = S::SinkError> + Send>
     where
         S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
         S::SinkError: Send,
@@ -269,7 +269,7 @@ where
         self,
         path: &str,
         sink: S,
-    ) -> Box<Future<Item = (Stats, S), Error = S::SinkError> + Send>
+    ) -> Box<dyn Future<Item = (Stats, S), Error = S::SinkError> + Send>
     where
         S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
         S::SinkError: Send,
