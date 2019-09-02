@@ -164,11 +164,11 @@ struct Starter<'a, E> {
 }
 
 struct DummyExecutor;
-impl Executor<Box<Future<Item = (), Error = ()> + Send>> for DummyExecutor {
+impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for DummyExecutor {
     fn execute(
         &self,
-        _future: Box<Future<Item = (), Error = ()> + Send>,
-    ) -> Result<(), futures::future::ExecuteError<Box<Future<Item = (), Error = ()> + Send>>> {
+        _future: Box<dyn Future<Item = (), Error = ()> + Send>,
+    ) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>> {
         unreachable!()
     }
 }
@@ -196,14 +196,14 @@ where
 {
     fn run_all<E>(self, starter: &mut Starter<'_, E>) -> Option<RunningTest<Error>>
     where
-        E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+        E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
     {
         self.run_test(starter, "")
     }
 
     fn run_test<E>(self, starter: &mut Starter<'_, E>, path: &str) -> Option<RunningTest<Error>>
     where
-        E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+        E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
     {
         match self {
             Test::Test { name, test } => {
@@ -454,7 +454,7 @@ where
     S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
     Error: fmt::Debug + fmt::Display + Send + 'static,
     S::SinkError: Send,
-    E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+    E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
 {
     let mut starter = Starter::with_executor(options, executor);
     let running_test = test.run_all(&mut starter);
@@ -503,7 +503,7 @@ pub fn executor_console_runner<Error, E>(
 ) -> impl Future<Item = (), Error = failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
-    E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+    E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
 {
     let color = options.color.0;
     let mut indent = String::new();
