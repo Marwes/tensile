@@ -1,10 +1,10 @@
-extern crate failure;
-extern crate futures;
-extern crate structopt;
+use failure;
+use futures;
+use structopt;
 #[macro_use]
 extern crate structopt_derive;
-extern crate termcolor;
-extern crate tokio_executor;
+use termcolor;
+use tokio_executor;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -176,11 +176,11 @@ impl<Error> Test<Error>
 where
     Error: Send + 'static,
 {
-    fn run_all(self, starter: &mut Starter) -> Option<RunningTest<Error>> {
+    fn run_all(self, starter: &mut Starter<'_>) -> Option<RunningTest<Error>> {
         self.run_test(starter, "")
     }
 
-    fn run_test(self, starter: &mut Starter, path: &str) -> Option<RunningTest<Error>> {
+    fn run_test(self, starter: &mut Starter<'_>, path: &str) -> Option<RunningTest<Error>> {
         match self {
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
@@ -530,7 +530,7 @@ where
 mod tests {
     use super::*;
 
-    extern crate tokio;
+    use tokio;
 
     use futures::sync::mpsc::channel;
     use futures::Stream;

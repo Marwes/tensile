@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate tensile;
-extern crate futures;
-extern crate tokio;
+
+use tokio;
 
 use futures::{future};
 use tensile::{console_runner, group, Options};
