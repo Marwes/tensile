@@ -1,10 +1,5 @@
-use failure;
-use futures;
-use structopt;
 #[macro_use]
 extern crate structopt_derive;
-use termcolor;
-use tokio_executor;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -12,8 +7,10 @@ use std::ops::{Add, AddAssign};
 
 use termcolor::WriteColor;
 
-use futures::future::{self, Either};
-use futures::{stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend};
+use futures::{
+    future::{self, Either, Executor},
+    stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend,
+};
 
 pub type TestFuture<E> = Box<dyn Future<Item = (), Error = E> + Send + 'static>;
 
@@ -108,7 +105,8 @@ impl Testable for bool {
                 Ok(())
             } else {
                 Err("false".to_string())
-            }.into_future(),
+            }
+            .into_future(),
         )
     }
 }
@@ -151,23 +149,43 @@ where
                         .map(|err| *err)
                         .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
                         .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
-                        .unwrap_or_else(|_| panic!("Unknown panic type"))).into_future(),
+                        .unwrap_or_else(|_| panic!("Unknown panic type")))
+                    .into_future(),
                 ),
             }
         }))
     }
 }
 
-struct Starter<'a> {
+struct Starter<'a, E> {
     options: &'a Options,
     filtered_tests: i32,
+    executor: Option<E>,
 }
 
-impl<'a> Starter<'a> {
-    fn new(options: &'a Options) -> Starter<'a> {
+struct DummyExecutor;
+impl Executor<Box<Future<Item = (), Error = ()> + Send>> for DummyExecutor {
+    fn execute(
+        &self,
+        _future: Box<Future<Item = (), Error = ()> + Send>,
+    ) -> Result<(), futures::future::ExecuteError<Box<Future<Item = (), Error = ()> + Send>>> {
+        unreachable!()
+    }
+}
+
+#[cfg(test)]
+impl<'a> Starter<'a, DummyExecutor> {
+    fn new(options: &'a Options) -> Self {
+        Self::with_executor(options, None)
+    }
+}
+
+impl<'a, E> Starter<'a, E> {
+    fn with_executor(options: &'a Options, executor: Option<E>) -> Self {
         Starter {
             options,
             filtered_tests: 0,
+            executor,
         }
     }
 }
@@ -176,23 +194,38 @@ impl<Error> Test<Error>
 where
     Error: Send + 'static,
 {
-    fn run_all(self, starter: &mut Starter<'_>) -> Option<RunningTest<Error>> {
+    fn run_all<E>(self, starter: &mut Starter<'_, E>) -> Option<RunningTest<Error>>
+    where
+        E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+    {
         self.run_test(starter, "")
     }
 
-    fn run_test(self, starter: &mut Starter<'_>, path: &str) -> Option<RunningTest<Error>> {
+    fn run_test<E>(self, starter: &mut Starter<'_, E>, path: &str) -> Option<RunningTest<Error>>
+    where
+        E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
+    {
         match self {
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
                 if test_path.contains(&starter.options.filter) {
-                    let (tx, rx) = futures::sync::oneshot::channel();
-                    tokio_executor::spawn(test.test().then(|result| {
-                        tx.send(result).ok().unwrap();
-                        Ok(())
-                    }));
+                    let test = test.test();
+                    let f = match &starter.executor {
+                        Some(executor) => {
+                            let (tx, rx) = futures::sync::oneshot::channel();
+                            executor
+                                .execute(Box::new(test.then(move |result| {
+                                    tx.send(result).ok().unwrap();
+                                    Ok(())
+                                })))
+                                .unwrap();
+                            Either::A(rx.then(|result| result.unwrap()))
+                        }
+                        None => Either::B(test),
+                    };
                     Some(RunTest::Test {
                         name,
-                        test: Box::new(rx.then(|result| result.unwrap())),
+                        test: Box::new(f),
                     })
                 } else {
                     starter.filtered_tests += 1;
@@ -411,17 +444,19 @@ struct TestReport {
     filtered_tests: i32,
 }
 
-fn execute_test_runner<S, Error>(
+fn execute_test_runner<S, Error, E>(
     sink: S,
     test: Test<Error>,
     options: &Options,
+    executor: Option<E>,
 ) -> impl Future<Item = TestReport, Error = S::SinkError>
 where
     S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
     Error: fmt::Debug + fmt::Display + Send + 'static,
     S::SinkError: Send,
+    E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
 {
-    let mut starter = Starter::new(options);
+    let mut starter = Starter::with_executor(options, executor);
     let running_test = test.run_all(&mut starter);
 
     let stats = match running_test {
@@ -436,12 +471,39 @@ where
     })
 }
 
+#[cfg(feature = "tokio-executor")]
+pub fn tokio_console_runner<Error>(
+    test: Test<Error>,
+    options: &Options,
+) -> impl Future<Item = (), Error = failure::Error>
+where
+    Error: fmt::Debug + fmt::Display + Send + 'static,
+{
+    executor_console_runner(
+        test,
+        options,
+        Some(tokio_executor::DefaultExecutor::current()),
+    )
+}
+
 pub fn console_runner<Error>(
     test: Test<Error>,
     options: &Options,
 ) -> impl Future<Item = (), Error = failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
+{
+    executor_console_runner(test, options, None::<DummyExecutor>)
+}
+
+pub fn executor_console_runner<Error, E>(
+    test: Test<Error>,
+    options: &Options,
+    executor: Option<E>,
+) -> impl Future<Item = (), Error = failure::Error>
+where
+    Error: fmt::Debug + fmt::Display + Send + 'static,
+    E: Executor<Box<Future<Item = (), Error = ()> + Send>>,
 {
     let color = options.color.0;
     let mut indent = String::new();
@@ -494,7 +556,7 @@ where
             stream::iter_ok(cmds)
         });
 
-    execute_test_runner(sink, test, options)
+    execute_test_runner(sink, test, options, executor)
         .from_err()
         .and_then(move |report| -> Result<_, failure::Error> {
             let mut writer = termcolor::StandardStream::stdout(color);
@@ -567,7 +629,8 @@ mod tests {
                 }
                 None => Either::B(future::ok(vec![])),
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
