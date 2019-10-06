@@ -1,9 +1,8 @@
-#[macro_use]
-extern crate structopt_derive;
-
-use std::fmt;
-use std::io::{self, Write};
-use std::ops::{Add, AddAssign};
+use std::{
+    fmt,
+    io::{self, Write},
+    ops::{Add, AddAssign},
+};
 
 use termcolor::WriteColor;
 
@@ -168,7 +167,8 @@ impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for DummyExecutor {
     fn execute(
         &self,
         _future: Box<dyn Future<Item = (), Error = ()> + Send>,
-    ) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>> {
+    ) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>>
+    {
         unreachable!()
     }
 }
@@ -386,7 +386,7 @@ where
     }
 }
 
-#[derive(Default, StructOpt)]
+#[derive(Default, structopt_derive::StructOpt)]
 pub struct Options {
     #[structopt(help = "String used to filter out tests")]
     filter: String,
