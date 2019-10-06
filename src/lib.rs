@@ -2,16 +2,20 @@ use std::{
     fmt,
     io::{self, Write},
     ops::{Add, AddAssign},
+    pin::Pin,
 };
 
 use termcolor::WriteColor;
 
 use futures::{
-    future::{self, Either, Executor},
-    stream, Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend,
+    future::{self, BoxFuture},
+    pin_mut,
+    prelude::*,
+    stream,
+    task::{self, SpawnExt},
 };
 
-pub type TestFuture<E> = Box<dyn Future<Item = (), Error = E> + Send + 'static>;
+pub type TestFuture<E> = BoxFuture<'static, Result<(), E>>;
 
 pub trait Testable: Send {
     type Error;
@@ -99,14 +103,13 @@ impl Testable for bool {
     type Error = String;
 
     fn test(self) -> TestFuture<Self::Error> {
-        Box::new(
+        Box::pin(async move {
             if self {
                 Ok(())
             } else {
                 Err("false".to_string())
             }
-            .into_future(),
-        )
+        })
     }
 }
 
@@ -114,7 +117,7 @@ impl Testable for () {
     type Error = String;
 
     fn test(self) -> TestFuture<Self::Error> {
-        Box::new(Ok(()).into_future())
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -125,7 +128,7 @@ where
     type Error = E;
 
     fn test(self) -> TestFuture<Self::Error> {
-        Box::new(self.into_future())
+        Box::pin(async { self })
     }
 }
 
@@ -138,21 +141,18 @@ where
     type Error = T::Error;
 
     fn test(self) -> TestFuture<Self::Error> {
-        Box::new(future::lazy(move || {
+        Box::pin(async move {
             let result = ::std::panic::catch_unwind(|| self().test());
             match result {
-                Ok(fut) => Either::A(fut),
-                Err(err) => Either::B(
-                    Err(err
-                        .downcast::<T::Error>()
-                        .map(|err| *err)
-                        .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
-                        .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
-                        .unwrap_or_else(|_| panic!("Unknown panic type")))
-                    .into_future(),
-                ),
+                Ok(fut) => fut.await,
+                Err(err) => Err(err
+                    .downcast::<T::Error>()
+                    .map(|err| *err)
+                    .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
+                    .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
+                    .unwrap_or_else(|_| panic!("Unknown panic type"))),
             }
-        }))
+        })
     }
 }
 
@@ -163,12 +163,11 @@ struct Starter<'a, E> {
 }
 
 struct DummyExecutor;
-impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for DummyExecutor {
-    fn execute(
-        &self,
-        _future: Box<dyn Future<Item = (), Error = ()> + Send>,
-    ) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>>
-    {
+impl task::Spawn for DummyExecutor {
+    fn spawn_obj(
+        &mut self,
+        _future: future::FutureObj<'static, ()>,
+    ) -> Result<(), task::SpawnError> {
         unreachable!()
     }
 }
@@ -196,37 +195,33 @@ where
 {
     fn run_all<E>(self, starter: &mut Starter<'_, E>) -> Option<RunningTest<Error>>
     where
-        E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
+        E: task::Spawn,
     {
         self.run_test(starter, "")
     }
 
     fn run_test<E>(self, starter: &mut Starter<'_, E>, path: &str) -> Option<RunningTest<Error>>
     where
-        E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
+        E: task::Spawn,
     {
         match self {
             Test::Test { name, test } => {
                 let test_path = format!("{}/{}", path, name);
                 if test_path.contains(&starter.options.filter) {
                     let test = test.test();
-                    let f = match &starter.executor {
+                    let f = match &mut starter.executor {
                         Some(executor) => {
-                            let (tx, rx) = futures::sync::oneshot::channel();
+                            let (tx, rx) = futures::channel::oneshot::channel();
                             executor
-                                .execute(Box::new(test.then(move |result| {
+                                .spawn(test.map(move |result| {
                                     tx.send(result).ok().unwrap();
-                                    Ok(())
-                                })))
+                                }))
                                 .unwrap();
-                            Either::A(rx.then(|result| result.unwrap()))
+                            rx.map(|result| result.unwrap()).boxed()
                         }
-                        None => Either::B(test),
+                        None => Box::pin(async move { test.await }),
                     };
-                    Some(RunTest::Test {
-                        name,
-                        test: Box::new(f),
-                    })
+                    Some(RunTest::Test { name, test: f })
                 } else {
                     starter.filtered_tests += 1;
                     None
@@ -281,75 +276,58 @@ impl<Error> RunningTest<Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
-    fn print_all<S>(
-        mut tests: Vec<RunningTest<Error>>,
-        path: String,
-        sink: S,
-    ) -> Box<dyn Future<Item = (Stats, S), Error = S::SinkError> + Send>
+    async fn print<'s, S>(self, sink: Pin<&'s mut S>) -> Result<Stats, S::Error>
     where
-        S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
-        S::SinkError: Send,
+        S: Sink<TestProgress<Error>> + Send + 'static,
+        S::Error: Send,
     {
-        match tests.pop() {
-            Some(test) => Box::new(test.print(&path, sink).and_then(|(s1, sink)| {
-                Self::print_all(tests, path, sink).map(|(s2, sink)| (s1 + s2, sink))
-            })),
-            None => Box::new(future::ok((Stats::default(), sink))),
-        }
+        self.print_path(&mut String::new(), sink).await
     }
 
-    fn print<S>(
+    fn print_path<'s, S>(
         self,
-        path: &str,
-        sink: S,
-    ) -> Box<dyn Future<Item = (Stats, S), Error = S::SinkError> + Send>
+        path: &'s mut String,
+        mut sink: Pin<&'s mut S>,
+    ) -> BoxFuture<'s, Result<Stats, S::Error>>
     where
-        S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
-        S::SinkError: Send,
+        S: Sink<TestProgress<Error>> + Send + 'static,
+        S::Error: Send,
     {
-        match self {
-            RunTest::Test { name, test } => Box::new(test.then(move |result| {
-                let stats = Stats {
-                    successful_tests: result.is_ok() as i32,
-                    failed_tests: result.is_err() as i32,
-                };
-                sink.send(TestProgress::Test(name, result))
-                    .map(|sink| (stats, sink))
-            })),
-            RunTest::Group { name, mut tests } => {
-                tests.reverse();
-                let owned_path = if path == "" {
-                    name.to_string()
-                } else {
-                    format!("{}/{}", path, name)
-                };
-                Box::new(
-                    sink.send(TestProgress::GroupStart(name.into()))
-                        .and_then(|sink| Self::print_all(tests, owned_path, sink))
-                        .and_then(|(stats, sink)| {
-                            sink.send(TestProgress::GroupEnd).map(|sink| (stats, sink))
-                        }),
-                )
+        Box::pin(async move {
+            match self {
+                RunTest::Test { name, test } => {
+                    let result = test.await;
+                    let stats = Stats {
+                        successful_tests: result.is_ok() as i32,
+                        failed_tests: result.is_err() as i32,
+                    };
+                    sink.send(TestProgress::Test(name, result)).await?;
+                    Ok(stats)
+                }
+                RunTest::Group { name, tests } => {
+                    let before = path.len();
+                    if path != "" {
+                        path.push('/');
+                    }
+                    path.push_str(&name);
+
+                    sink.as_mut()
+                        .send(TestProgress::GroupStart(name.into()))
+                        .await?;
+
+                    let mut stats = Stats::default();
+                    for test in tests {
+                        stats += test.print_path(path, sink.as_mut()).await?;
+                    }
+
+                    path.truncate(before);
+
+                    sink.as_mut().send(TestProgress::GroupEnd).await?;
+
+                    Ok(stats)
+                }
             }
-        }
-    }
-}
-
-struct Console<W, T> {
-    writer: W,
-    _marker: ::std::marker::PhantomData<T>,
-}
-
-impl<W, T> Console<W, T>
-where
-    W: termcolor::WriteColor,
-    T: fmt::Display,
-{
-    fn new(writer: W) -> Self {
-        Console {
-            writer,
-            _marker: ::std::marker::PhantomData,
-        }
+        })
     }
 }
 
@@ -361,28 +339,6 @@ struct Colored<T> {
 impl<T> From<T> for Colored<T> {
     fn from(msg: T) -> Self {
         Colored { color: None, msg }
-    }
-}
-
-impl<W, T> Sink for Console<W, T>
-where
-    W: termcolor::WriteColor,
-    T: fmt::Display,
-{
-    type SinkItem = Colored<T>;
-    type SinkError = io::Error;
-
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        match item.color {
-            Some(color) => self.writer.set_color(&color)?,
-            None => self.writer.reset()?,
-        }
-        write!(self.writer, "{}", item.msg)?;
-        Ok(AsyncSink::Ready)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        Ok(Async::Ready(()))
     }
 }
 
@@ -444,27 +400,27 @@ struct TestReport {
     filtered_tests: i32,
 }
 
-fn execute_test_runner<S, Error, E>(
-    sink: S,
+async fn execute_test_runner<S, Error, E>(
+    sink: Pin<&mut S>,
     test: Test<Error>,
     options: &Options,
     executor: Option<E>,
-) -> impl Future<Item = TestReport, Error = S::SinkError>
+) -> Result<TestReport, S::Error>
 where
-    S: Sink<SinkItem = TestProgress<Error>> + Send + 'static,
+    S: Sink<TestProgress<Error>> + Send + 'static,
     Error: fmt::Debug + fmt::Display + Send + 'static,
-    S::SinkError: Send,
-    E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
+    S::Error: Send,
+    E: task::Spawn,
 {
     let mut starter = Starter::with_executor(options, executor);
     let running_test = test.run_all(&mut starter);
 
     let stats = match running_test {
-        Some(running_test) => Either::A(running_test.print("", sink).from_err().map(|t| t.0)),
-        None => Either::B(future::ok(Stats::default())),
+        Some(running_test) => running_test.print(sink).err_into().await?,
+        None => Stats::default(),
     };
     let filtered_tests = starter.filtered_tests;
-    stats.map(move |stats| TestReport {
+    Ok(TestReport {
         failed_tests: stats.failed_tests,
         successful_tests: stats.successful_tests,
         filtered_tests,
@@ -472,10 +428,10 @@ where
 }
 
 #[cfg(feature = "tokio-executor")]
-pub fn tokio_console_runner<Error>(
+pub async fn tokio_console_runner<Error>(
     test: Test<Error>,
     options: &Options,
-) -> impl Future<Item = (), Error = failure::Error>
+) -> Result<(), failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
@@ -484,108 +440,122 @@ where
         options,
         Some(tokio_executor::DefaultExecutor::current()),
     )
+    .await
 }
 
-pub fn console_runner<Error>(
+pub async fn console_runner<Error>(
     test: Test<Error>,
     options: &Options,
-) -> impl Future<Item = (), Error = failure::Error>
+) -> Result<(), failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
-    executor_console_runner(test, options, None::<DummyExecutor>)
+    executor_console_runner(test, options, None::<DummyExecutor>).await
 }
 
-pub fn executor_console_runner<Error, E>(
+fn console_sink<T>(mut writer: impl WriteColor) -> impl Sink<Colored<T>, Error = io::Error>
+where
+    T: fmt::Display,
+{
+    futures::sink::drain()
+        .sink_map_err::<io::Error, _>(|_| unreachable!())
+        .with(move |item: Colored<T>| {
+            future::ready((|| -> io::Result<_> {
+                match item.color {
+                    Some(color) => writer.set_color(&color)?,
+                    None => writer.reset()?,
+                }
+                write!(writer, "{}", item.msg)?;
+                Ok(())
+            })())
+        })
+}
+
+pub async fn executor_console_runner<Error, E>(
     test: Test<Error>,
     options: &Options,
     executor: Option<E>,
-) -> impl Future<Item = (), Error = failure::Error>
+) -> Result<(), failure::Error>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
-    E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>>,
+    E: task::Spawn,
 {
     let color = options.color.0;
     let mut indent = String::new();
 
-    let sink =
-        Console::new(termcolor::StandardStream::stdout(color)).with_flat_map(move |progress| {
-            let cmds = match progress {
-                TestProgress::GroupStart(name) => {
-                    let msg = format!("{}{}\n", indent, name);
-                    indent.push('\t');
-                    vec![Colored {
-                        color: Some(termcolor::ColorSpec::new().set_bold(true).clone()),
-                        msg,
-                    }]
+    let writer = termcolor::StandardStream::stdout(color);
+    let sink = console_sink(writer).with_flat_map(move |progress| {
+        let cmds = match progress {
+            TestProgress::GroupStart(name) => {
+                let msg = format!("{}{}\n", indent, name);
+                indent.push('\t');
+                vec![Colored {
+                    color: Some(termcolor::ColorSpec::new().set_bold(true).clone()),
+                    msg,
+                }]
+            }
+            TestProgress::GroupEnd => {
+                indent.pop();
+                vec![Colored::from("\n".to_string())]
+            }
+            TestProgress::Test(name, result) => {
+                let name = Colored::from(format!("{}{} ... ", indent, name));
+                match result {
+                    Ok(()) => vec![
+                        name,
+                        Colored {
+                            color: Some(
+                                termcolor::ColorSpec::new()
+                                    .set_fg(Some(termcolor::Color::Green))
+                                    .clone(),
+                            ),
+                            msg: "ok".to_string(),
+                        },
+                        Colored::from("\n".to_string()),
+                    ],
+                    Err(err) => vec![
+                        name,
+                        Colored {
+                            color: Some(
+                                termcolor::ColorSpec::new()
+                                    .set_fg(Some(termcolor::Color::Red))
+                                    .clone(),
+                            ),
+                            msg: "FAILED".to_string(),
+                        },
+                        Colored::from(format!("\n{}", err)),
+                    ],
                 }
-                TestProgress::GroupEnd => {
-                    indent.pop();
-                    vec![Colored::from("\n".to_string())]
-                }
-                TestProgress::Test(name, result) => {
-                    let name = Colored::from(format!("{}{} ... ", indent, name));
-                    match result {
-                        Ok(()) => vec![
-                            name,
-                            Colored {
-                                color: Some(
-                                    termcolor::ColorSpec::new()
-                                        .set_fg(Some(termcolor::Color::Green))
-                                        .clone(),
-                                ),
-                                msg: "ok".to_string(),
-                            },
-                            Colored::from("\n".to_string()),
-                        ],
-                        Err(err) => vec![
-                            name,
-                            Colored {
-                                color: Some(
-                                    termcolor::ColorSpec::new()
-                                        .set_fg(Some(termcolor::Color::Red))
-                                        .clone(),
-                                ),
-                                msg: "FAILED".to_string(),
-                            },
-                            Colored::from(format!("\n{}", err)),
-                        ],
-                    }
-                }
-            };
-            stream::iter_ok(cmds)
-        });
+            }
+        };
+        stream::iter(cmds.into_iter().map(Ok))
+    });
+    pin_mut!(sink);
 
-    execute_test_runner(sink, test, options, executor)
-        .from_err()
-        .and_then(move |report| -> Result<_, failure::Error> {
-            let mut writer = termcolor::StandardStream::stdout(color);
-            write!(writer, "test result: ")?;
-            if report.failed_tests == 0 {
-                writer
-                    .set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
-                write!(writer, "ok")?;
-            } else {
-                writer
-                    .set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
-                write!(writer, "FAILED")?;
-            }
-            writer.reset()?;
-            writeln!(
-                writer,
-                ". {} passed; {} failed; {} filtered",
-                report.successful_tests, report.failed_tests, report.filtered_tests
-            )?;
-            // Filtering out all tests is almost certainly a mistake so report that as an error
-            let filtered_all_tests = report.failed_tests == 0
-                && report.successful_tests == 0
-                && report.filtered_tests != 0;
-            if report.failed_tests == 0 && !filtered_all_tests {
-                Ok(())
-            } else {
-                Err(failure::err_msg("One or more tests failed"))
-            }
-        })
+    let report = execute_test_runner(sink, test, options, executor).await?;
+    let mut writer = termcolor::StandardStream::stdout(color);
+    write!(writer, "test result: ")?;
+    if report.failed_tests == 0 {
+        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
+        write!(writer, "ok")?;
+    } else {
+        writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Red)))?;
+        write!(writer, "FAILED")?;
+    }
+    writer.reset()?;
+    writeln!(
+        writer,
+        ". {} passed; {} failed; {} filtered",
+        report.successful_tests, report.failed_tests, report.filtered_tests
+    )?;
+    // Filtering out all tests is almost certainly a mistake so report that as an error
+    let filtered_all_tests =
+        report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
+    if report.failed_tests == 0 && !filtered_all_tests {
+        Ok(())
+    } else {
+        Err(failure::err_msg("One or more tests failed"))
+    }
 }
 
 #[cfg(test)]
@@ -594,8 +564,7 @@ mod tests {
 
     use tokio;
 
-    use futures::sync::mpsc::channel;
-    use futures::Stream;
+    use futures::channel::mpsc::channel;
 
     use self::tokio::runtime::current_thread::Runtime;
 
@@ -611,26 +580,24 @@ mod tests {
         Error: fmt::Debug + fmt::Display + Send + 'static,
     {
         let mut core = Runtime::new().unwrap();
-        core.block_on(future::lazy(move || {
+        core.block_on(async move {
             let running_test = test.run_all(&mut Starter::new(&options));
 
             let (sender, receiver) = channel(10);
 
             match running_test {
                 Some(running_test) => {
-                    tokio::spawn(
-                        running_test
-                            .print("", sender.sink_map_err(|_| panic!()))
-                            .map(|_| ())
-                            .map_err(|_| ()),
-                    );
+                    tokio::spawn(async move {
+                        let sender = sender.sink_map_err(|_| panic!());
+                        pin_mut!(sender);
+                        running_test.print(sender).map(|_| ()).await
+                    });
 
-                    Either::A(receiver.collect())
+                    receiver.collect().await
                 }
-                None => Either::B(future::ok(vec![])),
+                None => vec![],
             }
-        }))
-        .unwrap()
+        })
     }
 
     #[test]

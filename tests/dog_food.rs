@@ -1,10 +1,4 @@
-#[macro_use]
-extern crate tensile;
-
-use tokio;
-
-use futures::{future};
-use tensile::{console_runner, group, Options};
+use tensile::{console_runner, group, tensile_fn, Options};
 
 fn test1() {
     assert!(true);
@@ -20,6 +14,6 @@ fn main() {
 
     let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
     runtime
-        .block_on(future::lazy(|| console_runner(test, &options)))
+        .block_on(async move { console_runner(test, &options).await })
         .unwrap_err();
 }
