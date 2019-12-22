@@ -132,6 +132,31 @@ where
     }
 }
 
+pub struct Future<F>(pub F);
+
+impl<F> Testable for Future<F>
+where
+    F: std::future::Future + Send + std::panic::UnwindSafe + 'static,
+    F::Output: Testable + 'static,
+    <F::Output as Testable>::Error: for<'a> From<&'a str> + From<String> + Send,
+{
+    type Error = <F::Output as Testable>::Error;
+
+    fn test(self) -> TestFuture<Self::Error> {
+        Box::pin(async move {
+            match self.0.catch_unwind().await {
+                Ok(out) => out.test().await,
+                Err(err) => Err(err
+                    .downcast::<<F::Output as Testable>::Error>()
+                    .map(|err| *err)
+                    .or_else(|err| err.downcast::<String>().map(|s| (*s).into()))
+                    .or_else(|err| err.downcast::<&str>().map(|s| (*s).into()))
+                    .unwrap_or_else(|_| panic!("Unknown panic type"))),
+            }
+        })
+    }
+}
+
 impl<F, T> Testable for F
 where
     F: FnOnce() -> T + Send + ::std::panic::UnwindSafe + 'static,
@@ -164,10 +189,7 @@ struct Starter<'a, E> {
 
 struct DummyExecutor;
 impl task::Spawn for DummyExecutor {
-    fn spawn_obj(
-        &mut self,
-        _future: future::FutureObj<'static, ()>,
-    ) -> Result<(), task::SpawnError> {
+    fn spawn_obj(&self, _future: future::FutureObj<'static, ()>) -> Result<(), task::SpawnError> {
         unreachable!()
     }
 }
@@ -427,7 +449,7 @@ where
     })
 }
 
-#[cfg(feature = "tokio-executor")]
+#[cfg(feature = "tokio")]
 pub async fn tokio_console_runner<Error>(
     test: Test<Error>,
     options: &Options,
@@ -435,12 +457,17 @@ pub async fn tokio_console_runner<Error>(
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
-    executor_console_runner(
-        test,
-        options,
-        Some(tokio_executor::DefaultExecutor::current()),
-    )
-    .await
+    struct TokioExecutor;
+    impl task::Spawn for TokioExecutor {
+        fn spawn_obj(
+            &self,
+            future: future::FutureObj<'static, ()>,
+        ) -> Result<(), task::SpawnError> {
+            tokio::spawn(future);
+            Ok(())
+        }
+    }
+    executor_console_runner(test, options, Some(TokioExecutor)).await
 }
 
 pub async fn console_runner<Error>(
@@ -566,49 +593,44 @@ mod tests {
 
     use futures::channel::mpsc::channel;
 
-    use self::tokio::runtime::current_thread::Runtime;
-
-    fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
+    async fn test_test<Error>(test: Test<Error>) -> Vec<TestProgress<Error>>
     where
         Error: fmt::Debug + fmt::Display + Send + 'static,
     {
-        options_test(test, Options::default())
+        options_test(test, Options::default()).await
     }
 
-    fn options_test<Error>(test: Test<Error>, options: Options) -> Vec<TestProgress<Error>>
+    async fn options_test<Error>(test: Test<Error>, options: Options) -> Vec<TestProgress<Error>>
     where
         Error: fmt::Debug + fmt::Display + Send + 'static,
     {
-        let mut core = Runtime::new().unwrap();
-        core.block_on(async move {
-            let running_test = test.run_all(&mut Starter::new(&options));
+        let running_test = test.run_all(&mut Starter::new(&options));
 
-            let (sender, receiver) = channel(10);
+        let (sender, receiver) = channel(10);
 
-            match running_test {
-                Some(running_test) => {
-                    tokio::spawn(async move {
-                        let sender = sender.sink_map_err(|_| panic!());
-                        pin_mut!(sender);
-                        running_test.print(sender).map(|_| ()).await
-                    });
+        match running_test {
+            Some(running_test) => {
+                tokio::spawn(async move {
+                    let sender = sender.sink_map_err(|_| panic!());
+                    pin_mut!(sender);
+                    running_test.print(sender).map(|_| ()).await
+                });
 
-                    receiver.collect().await
-                }
-                None => vec![],
+                receiver.collect().await
             }
-        })
+            None => vec![],
+        }
     }
 
-    #[test]
-    fn simple() {
-        let progress = test_test(test("1", true));
+    #[tokio::test]
+    async fn simple() {
+        let progress = test_test(test("1", true)).await;
         assert_eq!(progress, vec![TestProgress::Test("1".to_string(), Ok(()))]);
     }
 
-    #[test]
-    fn grouped_tests() {
-        let progress = test_test(group("group", vec![test("1", true), test("2", false)]));
+    #[tokio::test]
+    async fn grouped_tests() {
+        let progress = test_test(group("group", vec![test("1", true), test("2", false)])).await;
         assert_eq!(
             progress,
             vec![
@@ -620,12 +642,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nested_groups() {
+    #[tokio::test]
+    async fn nested_groups() {
         let progress = test_test(group(
             "group",
             vec![test("1", true), group("inner", vec![])],
-        ));
+        ))
+        .await;
         assert_eq!(
             progress,
             vec![
@@ -636,8 +659,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mixed_test_and_groups() {
+    #[tokio::test]
+    async fn mixed_test_and_groups() {
         let progress = test_test(group(
             "group",
             vec![
@@ -645,7 +668,8 @@ mod tests {
                 test("middle test", true),
                 group("inner2", vec![test("test2", false)]),
             ],
-        ));
+        ))
+        .await;
         assert_eq!(
             progress,
             vec![
@@ -662,15 +686,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_panic() {
+    #[tokio::test]
+    async fn handle_panic() {
         fn test1() {
             panic!("fail")
         }
         let progress = test_test(group(
             "group",
             vec![tensile_fn!(test1), test("test2", true)],
-        ));
+        ))
+        .await;
         assert_eq!(
             progress,
             vec![
@@ -682,8 +707,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filter() {
+    #[tokio::test]
+    async fn filter() {
         let progress = options_test(
             group(
                 "group",
@@ -697,7 +722,8 @@ mod tests {
                 filter: "test1".into(),
                 color: Color(termcolor::ColorChoice::Never),
             },
-        );
+        )
+        .await;
         assert_eq!(
             progress,
             vec![
