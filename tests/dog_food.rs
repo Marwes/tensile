@@ -13,5 +13,5 @@ async fn main() {
     let test = group("group1", vec![tensile_fn!(test1), tensile_fn!(test2)]);
     let options = Options::new();
 
-    console_runner(test, &options).await.unwrap_err();
+    assert!(!console_runner(test, &options).await.unwrap().passes());
 }

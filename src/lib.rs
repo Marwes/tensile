@@ -416,10 +416,19 @@ impl Options {
     }
 }
 
-struct TestReport {
-    failed_tests: i32,
-    successful_tests: i32,
-    filtered_tests: i32,
+pub struct TestReport {
+    pub failed_tests: i32,
+    pub successful_tests: i32,
+    pub filtered_tests: i32,
+}
+
+impl TestReport {
+    pub fn passes(&self) -> bool {
+        // Filtering out all tests is almost certainly a mistake so report that as an error
+        let filtered_all_tests =
+            self.failed_tests == 0 && self.successful_tests == 0 && self.filtered_tests != 0;
+        self.failed_tests == 0 && !filtered_all_tests
+    }
 }
 
 async fn execute_test_runner<S, Error, E>(
@@ -453,7 +462,7 @@ where
 pub async fn tokio_console_runner<Error>(
     test: Test<Error>,
     options: &Options,
-) -> Result<(), failure::Error>
+) -> io::Result<TestReport>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
@@ -470,10 +479,7 @@ where
     executor_console_runner(test, options, Some(TokioExecutor)).await
 }
 
-pub async fn console_runner<Error>(
-    test: Test<Error>,
-    options: &Options,
-) -> Result<(), failure::Error>
+pub async fn console_runner<Error>(test: Test<Error>, options: &Options) -> io::Result<TestReport>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
 {
@@ -502,7 +508,7 @@ pub async fn executor_console_runner<Error, E>(
     test: Test<Error>,
     options: &Options,
     executor: Option<E>,
-) -> Result<(), failure::Error>
+) -> io::Result<TestReport>
 where
     Error: fmt::Debug + fmt::Display + Send + 'static,
     E: task::Spawn,
@@ -575,14 +581,8 @@ where
         ". {} passed; {} failed; {} filtered",
         report.successful_tests, report.failed_tests, report.filtered_tests
     )?;
-    // Filtering out all tests is almost certainly a mistake so report that as an error
-    let filtered_all_tests =
-        report.failed_tests == 0 && report.successful_tests == 0 && report.filtered_tests != 0;
-    if report.failed_tests == 0 && !filtered_all_tests {
-        Ok(())
-    } else {
-        Err(failure::err_msg("One or more tests failed"))
-    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
