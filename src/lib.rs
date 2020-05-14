@@ -11,7 +11,6 @@ use futures::{
     future::{self, BoxFuture},
     pin_mut,
     prelude::*,
-    stream,
     task::{self, SpawnExt},
 };
 
@@ -494,20 +493,24 @@ where
     executor_console_runner(test, options, None::<DummyExecutor>).await
 }
 
-fn console_sink<T>(writer: termcolor::StandardStream) -> impl Sink<Colored<T>, Error = io::Error>
+fn console_sink<T>(
+    writer: termcolor::StandardStream,
+) -> impl Sink<Vec<Colored<T>>, Error = io::Error>
 where
     T: fmt::Display,
 {
     futures::sink::drain()
         .sink_map_err::<io::Error, _>(|_| unreachable!())
-        .with(move |item: Colored<T>| {
+        .with(move |items: Vec<Colored<T>>| {
             future::ready((|| -> io::Result<_> {
                 let mut writer = writer.lock();
-                match item.color {
-                    Some(color) => writer.set_color(&color)?,
-                    None => writer.reset()?,
+                for item in items {
+                    match item.color {
+                        Some(color) => writer.set_color(&color)?,
+                        None => writer.reset()?,
+                    }
+                    write!(writer, "{}", item.msg)?;
                 }
-                write!(writer, "{}", item.msg)?;
                 Ok(())
             })())
         })
@@ -526,7 +529,7 @@ where
     let mut indent = String::new();
 
     let writer = termcolor::StandardStream::stdout(color);
-    let sink = console_sink(writer).with_flat_map(move |progress| {
+    let sink = console_sink(writer).with(move |progress| {
         let cmds = match progress {
             TestProgress::GroupStart(name) => {
                 let msg = format!("{}{}\n", indent, name);
@@ -570,12 +573,13 @@ where
                 }
             }
         };
-        stream::iter(cmds.into_iter().map(Ok))
+        async { Ok::<_, io::Error>(cmds) }
     });
     pin_mut!(sink);
 
     let report = execute_test_runner(sink, test, options, executor).await?;
-    let mut writer = termcolor::StandardStream::stdout(color);
+    let writer = termcolor::StandardStream::stdout(color);
+    let mut writer = writer.lock();
     write!(writer, "test result: ")?;
     if report.failed_tests == 0 {
         writer.set_color(termcolor::ColorSpec::new().set_fg(Some(termcolor::Color::Green)))?;
