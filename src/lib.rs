@@ -494,7 +494,7 @@ where
     executor_console_runner(test, options, None::<DummyExecutor>).await
 }
 
-fn console_sink<T>(mut writer: impl WriteColor) -> impl Sink<Colored<T>, Error = io::Error>
+fn console_sink<T>(writer: termcolor::StandardStream) -> impl Sink<Colored<T>, Error = io::Error>
 where
     T: fmt::Display,
 {
@@ -502,6 +502,7 @@ where
         .sink_map_err::<io::Error, _>(|_| unreachable!())
         .with(move |item: Colored<T>| {
             future::ready((|| -> io::Result<_> {
+                let mut writer = writer.lock();
                 match item.color {
                     Some(color) => writer.set_color(&color)?,
                     None => writer.reset()?,
