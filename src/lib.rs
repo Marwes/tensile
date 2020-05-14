@@ -136,7 +136,7 @@ pub struct Future<F>(pub F);
 
 impl<F> Testable for Future<F>
 where
-    F: std::future::Future + Send + std::panic::UnwindSafe + 'static,
+    F: std::future::Future + Send + 'static,
     F::Output: Testable + 'static,
     <F::Output as Testable>::Error: for<'a> From<&'a str> + From<String> + Send,
 {
@@ -144,8 +144,14 @@ where
 
     fn test(self) -> TestFuture<Self::Error> {
         Box::pin(async move {
-            match self.0.catch_unwind().await {
-                Ok(out) => out.test().await,
+            match std::panic::AssertUnwindSafe(async {
+                let out = self.0.await;
+                out.test().await
+            })
+            .catch_unwind()
+            .await
+            {
+                Ok(out) => out,
                 Err(err) => Err(err
                     .downcast::<<F::Output as Testable>::Error>()
                     .map(|err| *err)
@@ -159,7 +165,7 @@ where
 
 impl<F, T> Testable for F
 where
-    F: FnOnce() -> T + Send + ::std::panic::UnwindSafe + 'static,
+    F: FnOnce() -> T + Send + 'static,
     T: Testable + 'static,
     T::Error: for<'a> From<&'a str> + From<String> + Send,
 {
@@ -167,9 +173,11 @@ where
 
     fn test(self) -> TestFuture<Self::Error> {
         Box::pin(async move {
-            let result = ::std::panic::catch_unwind(|| self().test());
+            let result = std::panic::AssertUnwindSafe(async { self().test().await })
+                .catch_unwind()
+                .await;
             match result {
-                Ok(fut) => fut.await,
+                Ok(out) => out,
                 Err(err) => Err(err
                     .downcast::<T::Error>()
                     .map(|err| *err)
